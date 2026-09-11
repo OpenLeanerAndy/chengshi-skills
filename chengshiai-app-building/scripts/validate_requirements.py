@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate chengshi-app-building requirement-state stage gates."""
+"""Validate chengshiai-app-building requirement-state stage gates."""
 
 from __future__ import annotations
 
