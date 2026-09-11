@@ -1,5 +1,5 @@
 ---
-name: chengshi-app-building
+name: chengshiai-app-building
 description: 用口语化问答的方式帮非技术员工制作AI应用。逐功能确认流程、数据和规则，先制作页面效果图，再生成完整《产品需求说明书.html》，经用户确认后开发、测试、打包并部署应用。
 ---
 
