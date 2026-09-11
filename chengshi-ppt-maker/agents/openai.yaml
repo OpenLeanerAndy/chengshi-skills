@@ -1,0 +1,4 @@
+interface:
+  display_name: "PPT Maker"
+  short_description: "高保真保留原文、数字、表格和图片，生成并逐页验收PPT。"
+  default_prompt: "使用 $chengshiai-ppt-maker 根据我提供的素材制作PPT，完整保留原文、数字、表格列与图片，并完成内容、结构和逐页视觉验收。"

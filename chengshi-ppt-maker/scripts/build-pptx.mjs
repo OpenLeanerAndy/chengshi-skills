@@ -1,0 +1,1235 @@
+#!/usr/bin/env node
+
+import fs from "node:fs";
+import path from "node:path";
+import process from "node:process";
+import { fileURLToPath } from "node:url";
+import { auditDeckSpec } from "./lib/deck-audit.mjs";
+import {
+  cellColspan,
+  cellText,
+  logicalColumns,
+  normalizeBlocks,
+  tableColumns,
+  tableHeaderRows,
+} from "./lib/deck-model.mjs";
+import { loadPptxGenJS, skillDir } from "./lib/pptxgen-loader.mjs";
+import { validatePptx } from "./validate-pptx.mjs";
+
+const SLIDE_W = 13.333;
+const SLIDE_H = 7.5;
+const ONE_CENTIMETER = 1 / 2.54;
+export const CONTENT_LOGO_PLACEMENT = Object.freeze({
+  top: ONE_CENTIMETER,
+  right: ONE_CENTIMETER,
+  w: 1.55,
+  h: 0.52,
+});
+const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
+const ALLOWED_IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif"]);
+const BODY_FONT_SIZE = 10;
+const BODY_TEXT_FONT_SIZE = 14;
+const BODY_LINE_SPACING = 1.3;
+const MIN_BODY_ROW_HEIGHT = 0.24;
+const DEFAULT_THEME = {
+  fontFace: "Source Han Sans SC",
+  colors: {
+    primary: "0B2791",
+    secondary: "009ADD",
+    text: "262626",
+    muted: "666666",
+    pale: "EAEFF7",
+    tableHeader: "4472C4",
+    white: "FFFFFF",
+    danger: "C00000",
+  },
+};
+
+function parseArgs(argv) {
+  const args = { input: null, output: null, validate: true, json: false };
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (token === "--input" || token === "-i") args.input = argv[++index];
+    else if (token === "--output" || token === "-o") args.output = argv[++index];
+    else if (token === "--no-validate") args.validate = false;
+    else if (token === "--json") args.json = true;
+    else throw new Error(`未知参数：${token}`);
+  }
+  if (!args.input) {
+    throw new Error(
+      "用法：node build-pptx.mjs --input deck.json [--output deck.pptx] [--no-validate] [--json]",
+    );
+  }
+  return args;
+}
+
+function normalizeColor(value, fallback) {
+  const normalized = String(value ?? fallback ?? "").replace(/^#/, "").toUpperCase();
+  if (!/^[0-9A-F]{6}$/.test(normalized)) {
+    throw new Error(`颜色必须为 6 位十六进制值：${value}`);
+  }
+  return normalized;
+}
+
+function makeTheme(theme = {}) {
+  const mergedColors = { ...DEFAULT_THEME.colors, ...(theme.colors ?? {}) };
+  for (const key of Object.keys(mergedColors)) {
+    mergedColors[key] = normalizeColor(mergedColors[key], DEFAULT_THEME.colors[key]);
+  }
+  return {
+    fontFace: theme.fontFace || DEFAULT_THEME.fontFace,
+    colors: mergedColors,
+  };
+}
+
+function sanitizeFilename(value) {
+  return String(value || "presentation")
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, "-")
+    .replace(/[. ]+$/g, "")
+    .trim() || "presentation";
+}
+
+function resolveAsset(assetPath, inputDir) {
+  if (!assetPath) return null;
+  if (/^https?:\/\//i.test(assetPath)) {
+    throw new Error("不支持远程图片 URL；请在获得用户许可后先下载为本地 PNG、JPEG 或 GIF。 ");
+  }
+  if (path.isAbsolute(assetPath)) return assetPath;
+  const candidates = [
+    path.resolve(inputDir, assetPath),
+    path.resolve(skillDir, assetPath),
+  ];
+  return candidates.find((candidate) => fs.existsSync(candidate)) ?? candidates[0];
+}
+
+function requireLocalAsset(assetPath, label) {
+  if (!fs.existsSync(assetPath)) throw new Error(`${label}不存在：${assetPath}`);
+}
+
+function imageDimensions(filePath) {
+  const buffer = fs.readFileSync(filePath);
+  if (buffer.length >= 24 && buffer.toString("ascii", 1, 4) === "PNG") {
+    return { format: "png", width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
+  }
+  if (buffer.length >= 10 && ["GIF87a", "GIF89a"].includes(buffer.toString("ascii", 0, 6))) {
+    return { format: "gif", width: buffer.readUInt16LE(6), height: buffer.readUInt16LE(8) };
+  }
+  if (buffer.length >= 4 && buffer[0] === 0xff && buffer[1] === 0xd8) {
+    let offset = 2;
+    while (offset + 9 < buffer.length) {
+      if (buffer[offset] !== 0xff) {
+        offset += 1;
+        continue;
+      }
+      const marker = buffer[offset + 1];
+      const size = buffer.readUInt16BE(offset + 2);
+      if ([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf].includes(marker)) {
+        return { format: "jpeg", width: buffer.readUInt16BE(offset + 7), height: buffer.readUInt16BE(offset + 5) };
+      }
+      if (size < 2) break;
+      offset += size + 2;
+    }
+  }
+  return null;
+}
+
+function containRect(dimensions, x, y, w, h) {
+  if (!dimensions?.width || !dimensions?.height) return { x, y, w, h };
+  const imageRatio = dimensions.width / dimensions.height;
+  const boxRatio = w / h;
+  if (imageRatio > boxRatio) {
+    const fittedH = w / imageRatio;
+    return { x, y: y + (h - fittedH) / 2, w, h: fittedH };
+  }
+  const fittedW = h * imageRatio;
+  return { x: x + (w - fittedW) / 2, y, w: fittedW, h };
+}
+
+function validatedImageOptions(filePath, box, altText = "") {
+  requireLocalAsset(filePath, "图片");
+  const extension = path.extname(filePath).toLowerCase();
+  if (!ALLOWED_IMAGE_EXTENSIONS.has(extension)) {
+    throw new Error(`图片格式不受支持：${filePath}。仅允许 PNG、JPEG 和 GIF。`);
+  }
+  const stat = fs.statSync(filePath);
+  if (!stat.isFile()) throw new Error(`图片路径不是文件：${filePath}`);
+  if (stat.size > MAX_IMAGE_BYTES) {
+    throw new Error(`图片超过 25 MB 安全上限：${filePath}`);
+  }
+  const dimensions = imageDimensions(filePath);
+  if (!dimensions?.width || !dimensions?.height) {
+    throw new Error(`图片内容与扩展名不匹配或文件已损坏：${filePath}`);
+  }
+  const expectedFormat = [".jpg", ".jpeg"].includes(extension) ? "jpeg" : extension.slice(1);
+  if (dimensions.format !== expectedFormat) {
+    throw new Error(`图片文件签名与扩展名不匹配：${filePath}`);
+  }
+  const fitted = containRect(dimensions, box.x, box.y, box.w, box.h);
+  return { path: filePath, ...fitted, altText };
+}
+
+function addImageContained(slide, filePath, box, altText = "") {
+  slide.addImage(validatedImageOptions(filePath, box, altText));
+}
+
+function validatedTopRightImageOptions(filePath, placement, altText) {
+  const fitted = validatedImageOptions(filePath, { x: 0, y: 0, w: placement.w, h: placement.h }, altText);
+  return {
+    ...fitted,
+    x: SLIDE_W - placement.right - fitted.w,
+    y: placement.top,
+  };
+}
+
+function defineLogoMasters(context) {
+  const base = { background: { color: context.theme.colors.white }, margin: 0 };
+  const contentObjects = context.logo
+    ? [{ image: validatedTopRightImageOptions(context.logo, CONTENT_LOGO_PLACEMENT, "Logo") }]
+    : [];
+  const titleObjects = context.logo
+    ? [{ image: validatedImageOptions(context.logo, { x: 9.42, y: 0.35, w: 3.41, h: 2.05 }, "Logo") }]
+    : [];
+  context.pptx.defineSlideMaster({ ...base, title: "PPT_MAKER_CONTENT", objects: contentObjects });
+  context.pptx.defineSlideMaster({ ...base, title: "PPT_MAKER_TITLE", objects: titleObjects });
+}
+
+function addPageNumber(slide, context, pageNumber) {
+  slide.addText(String(pageNumber), {
+    x: 12.25,
+    y: 7.03,
+    w: 0.45,
+    h: 0.2,
+    margin: 0,
+    fontFace: context.theme.fontFace,
+    fontSize: 10,
+    color: context.theme.colors.text,
+    align: "right",
+  });
+}
+
+function addHeader(slide, context, title, pageNumber) {
+  const { colors, fontFace } = context.theme;
+  assertTextFits(title, { w: 10.35, h: 0.48 }, "页面标题", 24, 0);
+  slide.addText(title, {
+    x: 0.6,
+    y: 0.4,
+    w: 10.35,
+    h: 0.48,
+    margin: 0,
+    fontFace,
+    fontSize: 24,
+    bold: true,
+    color: colors.text,
+    valign: "middle",
+  });
+  slide.addShape(context.pptx.ShapeType.line, {
+    x: 0.6,
+    y: 0.92,
+    w: 11.95,
+    h: 0,
+    line: { color: colors.secondary, width: 1.25 },
+  });
+  addPageNumber(slide, context, pageNumber);
+}
+
+function addTitleSlide(slide, context, spec) {
+  const { colors, fontFace } = context.theme;
+  slide.background = { color: colors.white };
+  const detail = [spec.department ?? context.deck.department, spec.date ?? context.deck.date]
+    .filter(Boolean)
+    .join("\n");
+  const lineBottom = detail ? 4.8 : 5.07;
+  slide.addShape(context.pptx.ShapeType.line, {
+    x: 1.65, y: 2.02, w: 0, h: lineBottom - 2.02,
+    line: { color: colors.primary, width: 1.5 },
+  });
+  slide.addShape(context.pptx.ShapeType.line, {
+    x: 1.75, y: 2.02, w: 0, h: lineBottom - 2.02,
+    line: { color: colors.secondary, width: 1.5 },
+  });
+  slide.addText(spec.title || context.deck.title, {
+    x: 2.1, y: 2.02, w: 8.95, h: 1.5,
+    margin: 0, fontFace, fontSize: 34, bold: true,
+    color: colors.primary, align: "center", valign: "middle", fit: "shrink",
+  });
+  if (detail) {
+    slide.addText(detail, {
+      x: 2.1, y: 3.95, w: 8.95, h: 0.85,
+      margin: 0, fontFace, fontSize: 14, bold: false,
+      color: colors.text, align: "center", valign: "middle", breakLine: false,
+    });
+  }
+}
+
+function agendaItems(spec, context) {
+  return spec.items ?? context.deck.agenda ?? [];
+}
+
+function chineseNumber(value) {
+  const digits = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
+  if (!Number.isInteger(value) || value < 1 || value > 99) return String(value);
+  if (value < 10) return digits[value];
+  const tens = Math.floor(value / 10);
+  const ones = value % 10;
+  return (tens > 1 ? digits[tens] : "") + "十" + (ones ? digits[ones] : "");
+}
+
+function addAgendaSlide(slide, context, spec, pageNumber, isSection = false) {
+  const { colors, fontFace } = context.theme;
+  slide.background = { color: colors.white };
+  slide.addText(spec.heading || "目录", {
+    x: 0.72, y: 0.45, w: 2, h: 0.5,
+    margin: 0, fontFace, fontSize: 24, bold: true, color: colors.primary,
+  });
+  slide.addShape(context.pptx.ShapeType.line, {
+    x: 0.72, y: 1.13, w: 10.2, h: 0,
+    line: { color: colors.primary, width: 2 },
+  });
+  slide.addShape(context.pptx.ShapeType.line, {
+    x: 10.92, y: 1.13, w: 1.15, h: 0,
+    line: { color: colors.secondary, width: 2 },
+  });
+  const items = agendaItems(spec, context);
+  if (items.length === 0 && isSection) {
+    slide.addText(spec.title || "章节", {
+      x: 2.35, y: 2.25, w: 8.7, h: 2.25,
+      margin: 0, fontFace, fontSize: 34, bold: true,
+      color: colors.primary, align: "center", valign: "middle", fit: "shrink",
+    });
+  } else {
+    const current = Number.isInteger(spec.current) ? spec.current : -1;
+    const rowH = Math.min(0.78, 4.9 / Math.max(items.length, 1));
+    items.forEach((item, index) => {
+      const active = !isSection || index === current;
+      const label = typeof item === "string" ? item : item.title;
+      const prefix = typeof item === "object" && item.index
+        ? item.index
+        : `${chineseNumber(index + 1)}、`;
+      const y = 1.65 + index * rowH;
+      slide.addText(prefix, {
+        x: 3.0, y, w: 0.7, h: rowH - 0.08,
+        margin: 0, fontFace, fontSize: 14, bold: true,
+        color: active ? colors.primary : colors.muted, valign: "middle",
+      });
+      slide.addText(label, {
+        x: 3.85, y, w: 6.9, h: rowH - 0.08,
+        margin: 0, fontFace, fontSize: 24, bold: active,
+        color: active ? colors.text : colors.muted, valign: "middle", fit: "shrink",
+      });
+    });
+  }
+  addPageNumber(slide, context, pageNumber);
+}
+
+function blockWeight(block) {
+  if (Number.isFinite(block.weight) && block.weight > 0) return block.weight;
+  if (block.type === "metrics") return 1.1;
+  if (block.type === "matrix") {
+    const count = block.items?.length ?? 1;
+    const columns = Number.isInteger(block.columns) ? block.columns : Math.min(3, Math.max(1, count));
+    return Math.max(1.4, Math.ceil(count / columns) * 1.15);
+  }
+  if (block.type === "callout") return 0.8;
+  if (block.type === "image" || block.type === "chart") return 2.1;
+  if (block.type === "table") return Math.max(1.5, ((block.rows?.length ?? 2) + 1) * 0.34);
+  if (block.type === "bullets") return Math.max(1, (block.items ?? []).join("").length / 90);
+  return Math.max(1, String(block.text ?? "").length / 120);
+}
+
+function displayUnits(value) {
+  let units = 0;
+  for (const character of String(value ?? "")) {
+    if (character === "\n") continue;
+    if (/\s/.test(character)) units += 0.35;
+    else if (character.codePointAt(0) > 0xff) units += 1;
+    else if (/[A-Z0-9]/.test(character)) units += 0.62;
+    else units += 0.52;
+  }
+  return units;
+}
+
+function estimatedWrappedLines(value, width, fontSize = BODY_FONT_SIZE) {
+  const glyphWidth = (fontSize / 72) * 0.92;
+  const capacity = Math.max(1, (width - 0.12) / glyphWidth);
+  return String(value ?? "").split(/\r?\n/).reduce(
+    (sum, paragraph) => sum + Math.max(1, Math.ceil(displayUnits(paragraph) / capacity)),
+    0,
+  );
+}
+
+function estimatedTextHeight(value, width, fontSize = BODY_FONT_SIZE, margin = 0.06) {
+  const lineHeight = (fontSize / 72) * BODY_LINE_SPACING;
+  return estimatedWrappedLines(value, width - margin * 2, fontSize) * lineHeight + margin * 2 + 0.04;
+}
+
+function assertTextFits(value, box, label, fontSize = BODY_FONT_SIZE, margin = 0.06, allowOverflow = false) {
+  const required = estimatedTextHeight(value, box.w, fontSize, margin);
+  if (!allowOverflow && required > box.h + 0.02) {
+    throw new Error(
+      `${label}预计需要 ${required.toFixed(2)} 英寸高度，但区域只有 ${box.h.toFixed(2)} 英寸；请增加区域、拆分模块或分页，不得缩小字号或让文字越界。`,
+    );
+  }
+}
+
+function layoutBlocks(blocks, box, { allowOverflow = false } = {}) {
+  const gap = 0.1;
+  const gapTotal = gap * Math.max(0, blocks.length - 1);
+  const preferred = blocks.map((block) => preferredBlockHeight(block, box.w));
+  const fixedTotal = preferred.reduce((sum, value) => sum + (value ?? 0), 0);
+  const flexibleIndexes = preferred.map((value, index) => value === null ? index : -1).filter((index) => index >= 0);
+  if (allowOverflow) {
+    const natural = blocks.map((block, index) => preferred[index] ?? naturalBlockHeight(block, box.w));
+    const naturalTotal = natural.reduce((sum, value) => sum + value, 0) + gapTotal;
+    if (naturalTotal > box.h + 0.02) {
+      let naturalCursor = box.y;
+      return blocks.map((block, index) => {
+        const placement = { block, x: box.x, y: naturalCursor, w: box.w, h: natural[index] };
+        naturalCursor += natural[index] + gap;
+        return placement;
+      });
+    }
+  }
+  if (fixedTotal + gapTotal > box.h + 0.02) {
+    throw new Error(`内容块在紧凑布局下仍需要 ${(fixedTotal + gapTotal).toFixed(2)} 英寸高度，但模块只有 ${box.h.toFixed(2)} 英寸；请增加模块高度或分页。`);
+  }
+  const flexibleSpace = box.h - fixedTotal - gapTotal;
+  const flexibleWeight = flexibleIndexes.reduce((sum, index) => sum + blockWeight(blocks[index]), 0) || 1;
+  let cursor = box.y;
+  return blocks.map((block, index) => {
+    const h = preferred[index] ?? flexibleSpace * (blockWeight(block) / flexibleWeight);
+    const placement = { block, x: box.x, y: cursor, w: box.w, h };
+    cursor += h + gap;
+    return placement;
+  });
+}
+
+function naturalBlockHeight(block, width) {
+  const type = String(block?.type ?? "text").toLowerCase();
+  if (type === "text") return Math.max(0.45, estimatedTextHeight(block.text ?? "", width, BODY_TEXT_FONT_SIZE));
+  if (type === "bullets") {
+    const text = (block.items ?? []).map((item) => typeof item === "string" ? item : item?.text ?? "").join("\n");
+    return Math.max(0.55, estimatedTextHeight(text, width, BODY_TEXT_FONT_SIZE));
+  }
+  if (type === "table") {
+    const headers = tableHeaderRows(block);
+    const columns = tableColumns(block);
+    const widths = normalizeColumnWidths(block, columns, width);
+    return [...headers.map((row) => estimateTableRowHeight(row, widths, { header: true })), ...(block.rows ?? []).map((row) => estimateTableRowHeight(row, widths))]
+      .reduce((sum, value) => sum + value, 0);
+  }
+  if (type === "image" || type === "chart") return Number(block.naturalHeight ?? 2.1);
+  return Math.max(0.65, blockWeight(block) * 0.7);
+}
+
+function preferredBlockHeight(block, width) {
+  const type = String(block?.type ?? "text").toLowerCase();
+  if (type === "subtitle") return 0.42;
+  if (type === "metrics" && block.fillHeight !== true) return metricPreferredHeight(block);
+  if (type === "matrix") return matrixGeometry(block, { w: width }).requiredHeight;
+  if (type === "callout" && block.fillHeight !== true) return calloutRequiredHeight(block, width);
+  return null;
+}
+
+function metricPreferredHeight(block) {
+  const value = Number(block.maxHeight ?? 1.35);
+  if (!Number.isFinite(value) || value < 0.85) throw new Error("metrics.maxHeight 必须是不小于0.85英寸的数字。 ");
+  return value;
+}
+
+function addTextBlock(slide, context, block, box) {
+  const value = String(block.text ?? "");
+  assertTextFits(value, box, "正文文本", BODY_TEXT_FONT_SIZE, 0.06, context.allowOverflow);
+  slide.addText(String(block.text ?? ""), {
+    x: box.x, y: box.y, w: box.w, h: box.h,
+    margin: 0.06, fontFace: context.theme.fontFace,
+    fontSize: BODY_TEXT_FONT_SIZE, color: context.theme.colors.text,
+    valign: "top", breakLine: false,
+    paraSpaceAfterPt: 3,
+  });
+}
+
+function addBulletsBlock(slide, context, block, box) {
+  const plainText = (block.items ?? [])
+    .map((item) => (typeof item === "string" ? item : item?.text ?? ""))
+    .join("\n");
+  assertTextFits(plainText, box, "项目符号文本", BODY_TEXT_FONT_SIZE, 0.06, context.allowOverflow);
+  const items = (block.items ?? []).map((item, index, array) => ({
+    text: typeof item === "string" ? item : item.text,
+    options: {
+      bullet: { indent: 12 },
+      hanging: 3,
+      breakLine: index < array.length - 1,
+      paraSpaceAfterPt: 3,
+      ...(typeof item === "object" && Number.isInteger(item.level)
+        ? { indentLevel: item.level }
+        : {}),
+    },
+  }));
+  slide.addText(items, {
+    x: box.x, y: box.y, w: box.w, h: box.h,
+    margin: 0.06, fontFace: context.theme.fontFace,
+    fontSize: BODY_TEXT_FONT_SIZE, color: context.theme.colors.text,
+    valign: "top",
+  });
+}
+
+function addMetricsBlock(slide, context, block, box) {
+  const items = block.items ?? [];
+  if (items.length === 0) return;
+  if (items.length > 8) throw new Error("单个指标组最多支持8项；请拆成多个指标组或分页。 ");
+  const gap = 0.1;
+  const cardW = (box.w - gap * (items.length - 1)) / items.length;
+  if (cardW < 0.8) throw new Error("指标卡宽度不足0.8英寸；请减少同组指标或增加模块宽度。 ");
+  const cardH = block.fillHeight === true ? box.h : Math.min(box.h, metricPreferredHeight(block));
+  if (cardH < 0.85) throw new Error("指标卡高度不足0.85英寸；请增加模块高度或减少同页内容。 ");
+  items.forEach((item, index) => {
+    const x = box.x + index * (cardW + gap);
+    const valueBox = { x: x + 0.04, y: box.y + 0.07, w: cardW - 0.08, h: cardH * 0.48 };
+    const label = [item.unit, item.label].filter(Boolean).join("\n");
+    const labelBox = { x: x + 0.06, y: box.y + cardH * 0.58, w: cardW - 0.12, h: cardH * 0.30 };
+    assertTextFits(String(item.value ?? ""), valueBox, "指标卡数值", 24, 0, context.allowOverflow);
+    assertTextFits(label, labelBox, "指标卡标签", BODY_FONT_SIZE, 0, context.allowOverflow);
+    slide.addShape(context.pptx.ShapeType.rect, {
+      x, y: box.y, w: cardW, h: cardH,
+      fill: { color: context.theme.colors.white },
+      line: { color: context.theme.colors.secondary, width: 0.75 },
+    });
+    slide.addText(String(item.value ?? ""), {
+      ...valueBox,
+      margin: 0, fontFace: context.theme.fontFace, fontSize: 24, bold: true,
+      color: normalizeColor(item.color, context.theme.colors.primary),
+      align: "center", valign: "middle",
+    });
+    slide.addText(label, {
+      ...labelBox,
+      margin: 0, fontFace: context.theme.fontFace, fontSize: 10, bold: true,
+      color: context.theme.colors.text, align: "center", valign: "middle",
+    });
+  });
+}
+
+function normalizeMatrixItem(item) {
+  if (typeof item === "string") return { title: "", body: item, meta: "" };
+  return {
+    title: String(item?.title ?? item?.label ?? ""),
+    body: String(item?.body ?? item?.text ?? item?.description ?? ""),
+    meta: Array.isArray(item?.meta) ? item.meta.join("\n") : String(item?.meta ?? ""),
+    color: item?.color,
+  };
+}
+
+function matrixColumns(count, box, requested) {
+  if (Number.isInteger(requested)) {
+    if (requested < 1 || requested > 4) throw new Error("matrix.columns 必须为 1–4 的整数。 ");
+    return Math.min(requested, count);
+  }
+  let columns = count <= 2 ? count : count <= 6 ? 3 : 4;
+  while (columns > 1 && (box.w - 0.1 * (columns - 1)) / columns < 1.65) columns -= 1;
+  return columns;
+}
+
+function matrixGeometry(block, box) {
+  const items = (block.items ?? []).map(normalizeMatrixItem);
+  if (items.length === 0) throw new Error("事项矩阵必须包含 items。 ");
+  if (items.length > 12) throw new Error("单个事项矩阵最多支持12项；请拆成多个模块或连续页面。 ");
+  const gap = 0.1;
+  const columns = matrixColumns(items.length, box, block.columns);
+  const rows = Math.ceil(items.length / columns);
+  const cardW = (box.w - gap * (columns - 1)) / columns;
+  const titleH = 0.31;
+  const rowHeights = Array.from({ length: rows }, (_, row) => {
+    const rowItems = items.slice(row * columns, (row + 1) * columns);
+    return Math.max(0.75, ...rowItems.map((item) => {
+      const detail = [item.body, item.meta].filter(Boolean).join("\n");
+      return titleH + 0.14 + estimatedTextHeight(detail, cardW - 0.16, BODY_FONT_SIZE, 0.06);
+    }));
+  });
+  const requiredHeight = rowHeights.reduce((sum, value) => sum + value, 0) + gap * (rows - 1);
+  const rowOffsets = [];
+  rowHeights.reduce((cursor, height, index) => {
+    rowOffsets[index] = cursor;
+    return cursor + height + gap;
+  }, 0);
+  return { items, gap, columns, cardW, titleH, rowHeights, rowOffsets, requiredHeight };
+}
+
+function addMatrixBlock(slide, context, block, box) {
+  const { items, gap, columns, cardW, titleH, rowHeights, rowOffsets, requiredHeight } = matrixGeometry(block, box);
+  if (!context.allowOverflow && requiredHeight > box.h + 0.02) {
+    throw new Error(`事项矩阵预计需要 ${requiredHeight.toFixed(2)} 英寸高度，但区域只有 ${box.h.toFixed(2)} 英寸；请增加模块高度、减少同页事项或分页。`);
+  }
+  items.forEach((item, index) => {
+    const row = Math.floor(index / columns);
+    const column = index % columns;
+    const x = box.x + column * (cardW + gap);
+    const y = box.y + rowOffsets[row];
+    const cardH = rowHeights[row];
+    const accent = normalizeColor(item.color, context.theme.colors.secondary);
+    slide.addShape(context.pptx.ShapeType.rect, {
+      x, y, w: cardW, h: cardH,
+      fill: { color: context.theme.colors.white },
+      line: { color: accent, width: 0.65 },
+    });
+    slide.addShape(context.pptx.ShapeType.rect, {
+      x, y, w: cardW, h: titleH,
+      fill: { color: context.theme.colors.pale },
+      line: { color: accent, width: 0.4 },
+    });
+    const title = item.title || `事项${index + 1}`;
+    assertTextFits(title, { w: cardW - 0.14, h: titleH - 0.08 }, "事项矩阵标题", BODY_FONT_SIZE, 0, context.allowOverflow);
+    slide.addText(title, {
+      x: x + 0.07, y: y + 0.04, w: cardW - 0.14, h: titleH - 0.08,
+      margin: 0, fontFace: context.theme.fontFace, fontSize: BODY_FONT_SIZE, bold: true,
+      color: context.theme.colors.primary, align: "left", valign: "middle",
+    });
+    const detail = [item.body, item.meta].filter(Boolean).join("\n");
+    const detailBox = { x: x + 0.08, y: y + titleH + 0.07, w: cardW - 0.16, h: cardH - titleH - 0.14 };
+    assertTextFits(detail, detailBox, "事项矩阵正文", BODY_FONT_SIZE, 0.06, context.allowOverflow);
+    slide.addText(detail, {
+      ...detailBox, margin: 0, fontFace: context.theme.fontFace, fontSize: BODY_FONT_SIZE,
+      color: context.theme.colors.text, align: "left", valign: "top", paraSpaceAfterPt: 3,
+    });
+  });
+}
+
+function calloutRequiredHeight(block, width) {
+  const label = String(block.label ?? block.title ?? "提示");
+  const value = String(block.text ?? block.body ?? "");
+  if (!value) throw new Error("提示块必须包含 text。 ");
+  const labelW = Math.min(2.0, Math.max(0.95, displayUnits(label) * 0.13 + 0.3));
+  return Math.max(0.55, estimatedTextHeight(value, width - labelW - 0.12, BODY_FONT_SIZE, 0) + 0.12);
+}
+
+function addCalloutBlock(slide, context, block, box) {
+  const label = String(block.label ?? block.title ?? "提示");
+  const value = String(block.text ?? block.body ?? "");
+  if (!value) throw new Error("提示块必须包含 text。 ");
+  const tone = String(block.tone ?? "primary").toLowerCase();
+  const accent = tone === "danger"
+    ? context.theme.colors.danger
+    : tone === "muted"
+      ? context.theme.colors.muted
+      : context.theme.colors.primary;
+  const fill = tone === "danger" ? "FCE8E6" : context.theme.colors.pale;
+  const labelW = Math.min(2.0, Math.max(0.95, displayUnits(label) * 0.13 + 0.3));
+  const requiredHeight = calloutRequiredHeight(block, box.w);
+  if (!context.allowOverflow && requiredHeight > box.h + 0.02) throw new Error(`提示块预计需要 ${requiredHeight.toFixed(2)} 英寸高度，但区域只有 ${box.h.toFixed(2)} 英寸。`);
+  const h = block.fillHeight === true ? box.h : requiredHeight;
+  slide.addShape(context.pptx.ShapeType.rect, {
+    x: box.x, y: box.y, w: box.w, h,
+    fill: { color: fill }, line: { color: accent, width: 0.75 },
+  });
+  slide.addShape(context.pptx.ShapeType.rect, {
+    x: box.x, y: box.y, w: 0.07, h,
+    fill: { color: accent }, line: { color: accent, width: 0 },
+  });
+  assertTextFits(label, { w: labelW - 0.18, h: h - 0.12 }, "提示块标签", BODY_FONT_SIZE, 0, context.allowOverflow);
+  slide.addText(label, {
+    x: box.x + 0.14, y: box.y + 0.06, w: labelW - 0.18, h: h - 0.12,
+    margin: 0, fontFace: context.theme.fontFace, fontSize: BODY_FONT_SIZE, bold: true,
+    color: accent, align: "left", valign: "middle",
+  });
+  const textBox = { x: box.x + labelW, y: box.y + 0.06, w: box.w - labelW - 0.12, h: h - 0.12 };
+  assertTextFits(value, textBox, "提示块正文", BODY_FONT_SIZE, 0, context.allowOverflow);
+  slide.addText(value, {
+    ...textBox, margin: 0, fontFace: context.theme.fontFace, fontSize: BODY_FONT_SIZE,
+    color: context.theme.colors.text, align: "left", valign: "middle",
+  });
+}
+
+function numericValue(value) {
+  return typeof value === "number" || /^[-+]?\d[\d,.]*(%|万|亿|元)?$/.test(String(value).trim());
+}
+
+function styleTableCell(cell, context, { header, rowIndex }) {
+  const value = cellText(cell);
+  const provided = cell && typeof cell === "object" && !Array.isArray(cell) ? cell : {};
+  const options = {
+    ...(header
+      ? {
+        bold: true,
+        color: context.theme.colors.white,
+        fill: { color: context.theme.colors.tableHeader },
+        align: "center",
+      }
+      : {
+        color: context.theme.colors.text,
+        fill: { color: context.theme.colors.pale },
+        align: numericValue(value) ? "right" : "left",
+      }),
+    ...(provided.options ?? {}),
+  };
+  for (const key of ["colspan", "rowspan"]) {
+    const raw = provided[key] ?? provided.options?.[key];
+    if (Number.isInteger(Number(raw)) && Number(raw) > 1) options[key] = Number(raw);
+  }
+  return { text: value, options };
+}
+
+function normalizeColumnWidths(block, columnCount, width) {
+  if (block.colWidths !== undefined && (!Array.isArray(block.colWidths) || block.colWidths.length !== columnCount)) {
+    throw new Error(`表格 colWidths 必须包含 ${columnCount} 个宽度值，不得通过少给一列来隐藏字段。`);
+  }
+  const raw = block.colWidths?.map(Number) ?? Array(columnCount).fill(1);
+  if (raw.some((value) => !Number.isFinite(value) || value <= 0)) throw new Error("表格 colWidths 必须全部为正数。 ");
+  const total = raw.reduce((sum, value) => sum + value, 0);
+  return raw.map((value) => (value / total) * width);
+}
+
+function estimateTableRowHeight(row, widths, { header = false } = {}) {
+  let column = 0;
+  let lines = 1;
+  for (const cell of row) {
+    const span = cellColspan(cell);
+    const cellWidth = widths.slice(column, column + span).reduce((sum, value) => sum + value, 0);
+    lines = Math.max(lines, estimatedWrappedLines(cellText(cell), Math.max(0.2, cellWidth - 0.07), BODY_FONT_SIZE));
+    column += span;
+  }
+  const lineHeight = (BODY_FONT_SIZE / 72) * BODY_LINE_SPACING;
+  return Math.max(header ? 0.31 : MIN_BODY_ROW_HEIGHT, lines * lineHeight + 0.10);
+}
+
+function renderTable(slide, context, headerRows, bodyRows, box, widths, { allowOverflow = false } = {}) {
+  const data = [
+    ...headerRows.map((row) => row.map((cell) => styleTableCell(cell, context, { header: true, rowIndex: 0 }))),
+    ...bodyRows.map((row, rowIndex) => row.map((cell) => styleTableCell(cell, context, { header: false, rowIndex }))),
+  ];
+  const rowHeights = [
+    ...headerRows.map((row) => estimateTableRowHeight(row, widths, { header: true })),
+    ...bodyRows.map((row) => estimateTableRowHeight(row, widths)),
+  ];
+  const height = rowHeights.reduce((sum, value) => sum + value, 0);
+  if (!allowOverflow && height > box.h + 0.02) throw new Error("内部错误：表格分段后仍超过目标区域。 ");
+  slide.addTable(data, {
+    x: box.x, y: box.y, w: box.w, h: height,
+    colW: widths,
+    rowH: rowHeights,
+    margin: 0.035,
+    fontFace: context.theme.fontFace,
+    fontSize: BODY_FONT_SIZE,
+    border: { type: "solid", color: context.theme.colors.white, pt: 0.5 },
+    autoFit: false,
+    autoPage: false,
+    valign: "middle",
+  });
+}
+
+function splitRowsByHeight(rows, widths, headerRows, height, segmentCount = 2) {
+  const headerHeight = headerRows.reduce((sum, row) => sum + estimateTableRowHeight(row, widths, { header: true }), 0);
+  if (headerHeight >= height) throw new Error("表格多级表头本身已超过目标区域高度。 ");
+  const capacity = height - headerHeight;
+  const rowHeights = rows.map((row) => estimateTableRowHeight(row, widths));
+  for (const rowHeight of rowHeights) {
+    if (headerHeight + rowHeight > height) {
+      throw new Error("表格存在单行内容过长，无法在10号字下完整显示；请加宽长文本列或把该记录改为独立页面。 ");
+    }
+  }
+  const total = rowHeights.reduce((sum, value) => sum + value, 0);
+  const required = Math.ceil(total / capacity);
+  if (required > segmentCount || rows.length < segmentCount) return { segments: null, required: Math.max(required, segmentCount) };
+  const segments = [];
+  let start = 0;
+  let remainingHeight = total;
+  for (let segment = 0; segment < segmentCount; segment += 1) {
+    const remainingSegments = segmentCount - segment;
+    if (remainingSegments === 1) {
+      segments.push(rows.slice(start));
+      break;
+    }
+    const target = remainingHeight / remainingSegments;
+    let used = 0;
+    let end = start;
+    const lastAllowed = rows.length - (remainingSegments - 1);
+    while (end < lastAllowed) {
+      const next = rowHeights[end];
+      if (used > 0 && used + next > target && used <= capacity + 0.02) break;
+      if (used + next > capacity + 0.02) break;
+      used += next;
+      end += 1;
+    }
+    if (end === start) return { segments: null, required: segmentCount + 1 };
+    segments.push(rows.slice(start, end));
+    start = end;
+    remainingHeight -= used;
+  }
+  if (segments.length !== segmentCount || segments.some((segment) => segment.length === 0)) {
+    return { segments: null, required: segmentCount + 1 };
+  }
+  const valid = segments.every((segment) => segment.reduce((sum, row) => sum + estimateTableRowHeight(row, widths), 0) <= capacity + 0.02);
+  return valid ? { segments, required: segmentCount } : { segments: null, required: segmentCount + 1 };
+}
+
+function addTableBlock(slide, context, block, box) {
+  const headerRows = tableHeaderRows(block);
+  const rows = Array.isArray(block.rows) ? block.rows : [];
+  if (headerRows.length === 0) throw new Error("表格必须包含 headers 或 headerRows。 ");
+  if (headerRows.length > 3) throw new Error("表格最多支持3行多级表头；请先核对源表结构。 ");
+  const columnCount = tableColumns(block);
+  if (columnCount === 0) throw new Error("表格没有可识别的列。 ");
+  for (const [index, row] of rows.entries()) {
+    if (logicalColumns(row) !== columnCount) {
+      throw new Error(`表格正文第 ${index + 1} 行为 ${logicalColumns(row)} 列，表格应为 ${columnCount} 列；不得删除最左列或其他字段。`);
+    }
+  }
+
+  const widths = normalizeColumnWidths(block, columnCount, box.w);
+  const totalHeight = [...headerRows.map((row) => estimateTableRowHeight(row, widths, { header: true })), ...rows.map((row) => estimateTableRowHeight(row, widths))]
+    .reduce((sum, value) => sum + value, 0);
+  if (totalHeight <= box.h + 0.02) {
+    renderTable(slide, context, headerRows, rows, box, widths);
+    return;
+  }
+
+  if (context.allowOverflow) {
+    renderTable(slide, context, headerRows, rows, box, widths, { allowOverflow: true });
+    return;
+  }
+
+  const splitMode = String(block.splitMode ?? "none").toLowerCase();
+  if (!["rows-two-column", "rows-three-column", "columns", "paginate", "none"].includes(splitMode)) throw new Error(`不支持的表格 splitMode：${splitMode}`);
+  if (splitMode === "none") {
+    throw new Error(`表格预计需要 ${totalHeight.toFixed(2)} 英寸高度，但区域只有 ${box.h.toFixed(2)} 英寸；请先在大纲中确认拆分方案，不得自动分栏、越界或裁切。`);
+  }
+  if (!String(block.splitReason ?? "").trim() || !String(block.approvalRef ?? "").trim()) {
+    throw new Error("表格拆分必须显式提供 splitReason 和 approvalRef；禁止生成阶段自动决定拆分。 ");
+  }
+  if (splitMode === "paginate") {
+    throw new Error("模块内表格不能直接 paginate；请在大纲阶段改为独立连续表格页。 ");
+  }
+  const segmentCount = splitMode === "rows-three-column" ? 3 : 2;
+  const maxColumns = segmentCount === 3 ? Number(block.maxColumnsForThreeSplit ?? 4) : Number(block.maxColumnsForSideSplit ?? 6);
+  if (columnCount > maxColumns || box.w < 8) {
+    throw new Error(`表格有 ${columnCount} 列且纵向超高，不适合左右并排；请在大纲阶段拆成连续页面，每页保留全部列和重复表头。`);
+  }
+
+  const gap = Number.isFinite(block.splitGap) ? block.splitGap : 0.16;
+  const segmentWidth = (box.w - gap * (segmentCount - 1)) / segmentCount;
+  const segmentWidths = normalizeColumnWidths(block, columnCount, segmentWidth);
+  const split = splitRowsByHeight(rows, segmentWidths, headerRows, box.h, segmentCount);
+  if (!split.segments) {
+    throw new Error(`表格在10号字下至少需要 ${split.required} 个纵向分段；当前已尝试同页 ${segmentCount} 段，请返回大纲阶段继续重排并询问用户是否拆页。`);
+  }
+  const segments = split.segments;
+  segments.forEach((segment, index) => {
+    renderTable(slide, context, headerRows, segment, { ...box, x: box.x + index * (segmentWidth + gap), w: segmentWidth }, segmentWidths);
+  });
+}
+
+function addChartBlock(slide, context, block, box) {
+  const type = String(block.chartType ?? block.kind ?? "bar").toLowerCase();
+  const typeMap = {
+    bar: context.pptx.ChartType.bar,
+    column: context.pptx.ChartType.bar,
+    line: context.pptx.ChartType.line,
+    pie: context.pptx.ChartType.pie,
+    doughnut: context.pptx.ChartType.doughnut,
+  };
+  if (!typeMap[type]) throw new Error(`不支持的图表类型：${type}`);
+  const series = block.series ?? [];
+  if (series.length === 0) throw new Error("图表必须包含 series。 ");
+  const options = {
+    x: box.x, y: box.y, w: box.w, h: box.h,
+    fontFace: context.theme.fontFace,
+    fontSize: 10,
+    showLegend: block.showLegend ?? series.length > 1,
+    legendPos: block.legendPos ?? "b",
+    showTitle: Boolean(block.title),
+    title: block.title,
+    chartColors: (block.colors ?? [context.theme.colors.primary, context.theme.colors.secondary, "7EA6E0"])
+      .map((color) => normalizeColor(color)),
+    showValue: block.showValue ?? true,
+    showPercent: block.showPercent ?? ["pie", "doughnut"].includes(type),
+    showCatName: block.showCatName ?? false,
+    catAxisLabelColor: context.theme.colors.muted,
+    valAxisLabelColor: context.theme.colors.muted,
+    valGridLine: { color: "D9E2F3", size: 0.5 },
+    showBorder: false,
+  };
+  if (type === "bar" || type === "column") options.barDir = type === "bar" ? "bar" : "col";
+  if (type === "line") options.lineSize = block.lineSize ?? 2;
+  slide.addChart(typeMap[type], series, options);
+}
+
+function addImageBlock(slide, context, block, box) {
+  const filePath = resolveAsset(block.path, context.inputDir);
+  if (!filePath) throw new Error("图片块必须包含 path。 ");
+  addImageContained(slide, filePath, box, block.altText ?? "演示文稿图片");
+}
+
+function addSubtitleBlock(slide, context, block, box) {
+  const text = String(block.text ?? block.title ?? "");
+  if (!text) throw new Error("子标题必须包含 text。 ");
+  const { colors, fontFace } = context.theme;
+  const underlineGap = 0.1;
+  const textBox = { x: box.x, y: box.y, w: box.w, h: Math.max(0.28, box.h - underlineGap) };
+  assertTextFits(text, textBox, "子模块标题", 14, 0, context.allowOverflow);
+  slide.addText(text, {
+    x: textBox.x, y: textBox.y, w: textBox.w, h: textBox.h,
+    margin: 0, fontFace, fontSize: 14, bold: true,
+    color: colors.primary, align: "center", valign: "middle",
+  });
+  slide.addShape(context.pptx.ShapeType.line, {
+    x: box.x + box.w * 0.3, y: box.y + box.h - underlineGap / 2, w: box.w * 0.4, h: 0,
+    line: { color: colors.primary, width: 1 },
+  });
+}
+
+function renderBlock(slide, context, placement) {
+  const { block, ...box } = placement;
+  const type = String(block.type ?? "text").toLowerCase();
+  if (type === "text") addTextBlock(slide, context, block, box);
+  else if (type === "subtitle") addSubtitleBlock(slide, context, block, box);
+  else if (type === "bullets") addBulletsBlock(slide, context, block, box);
+  else if (type === "metrics") addMetricsBlock(slide, context, block, box);
+  else if (type === "matrix") addMatrixBlock(slide, context, block, box);
+  else if (type === "callout") addCalloutBlock(slide, context, block, box);
+  else if (type === "table") addTableBlock(slide, context, block, box);
+  else if (type === "chart") addChartBlock(slide, context, block, box);
+  else if (type === "image") addImageBlock(slide, context, block, box);
+  else throw new Error(`不支持的内容块类型：${type}`);
+}
+
+function addModule(slide, context, module, box) {
+  const { colors, fontFace } = context.theme;
+  const titleH = 0.38;
+  assertTextFits(module.title || "", { w: box.w - 0.1, h: titleH - 0.06 }, "模块标题", 14, 0);
+  slide.addShape(context.pptx.ShapeType.rect, {
+    x: box.x, y: box.y, w: box.w, h: titleH,
+    fill: { color: normalizeColor(module.titleColor, colors.primary) },
+    line: { color: normalizeColor(module.titleColor, colors.primary), width: 0.5 },
+  });
+  slide.addText(module.title || "", {
+    x: box.x + 0.05, y: box.y + 0.03, w: box.w - 0.1, h: titleH - 0.06,
+    margin: 0, fontFace, fontSize: 14, bold: true,
+    color: colors.white, align: "center", valign: "middle",
+  });
+  slide.addShape(context.pptx.ShapeType.rect, {
+    x: box.x, y: box.y + titleH, w: box.w, h: box.h - titleH,
+    fill: { color: colors.white, transparency: 100 },
+    line: { color: colors.secondary, width: 0.75 },
+  });
+  const inner = {
+    x: box.x + 0.12,
+    y: box.y + titleH + 0.11,
+    w: box.w - 0.24,
+    h: box.h - titleH - 0.22,
+  };
+  const blocks = normalizeBlocks(module);
+  layoutBlocks(blocks, inner, { allowOverflow: context.allowOverflow }).forEach((placement) => renderBlock(slide, context, placement));
+}
+
+function gridColumns(count, requested) {
+  if (Number.isInteger(requested) && requested >= 1 && requested <= 4) return requested;
+  return 1;
+}
+
+function normalizedSegments(weights, start, length, gap) {
+  if (weights.some((value) => !Number.isFinite(value) || value <= 0)) throw new Error("布局权重必须全部为正数。 ");
+  const available = length - gap * Math.max(0, weights.length - 1);
+  const total = weights.reduce((sum, value) => sum + value, 0);
+  let cursor = start;
+  return weights.map((weight) => {
+    const size = available * (weight / total);
+    const segment = { start: cursor, size };
+    cursor += size + gap;
+    return segment;
+  });
+}
+
+function moduleContentWeight(module) {
+  return Math.max(1, normalizeBlocks(module).reduce((sum, block) => sum + blockWeight(block), 0));
+}
+
+function explicitModuleLayout(modules, area) {
+  if (!modules.some((module) => module.layout)) return null;
+  if (!modules.every((module) => module.layout)) throw new Error("使用 module.layout 时，每个模块都必须提供归一化 x、y、w、h。 ");
+  const boxes = modules.map((module, index) => {
+    const layout = module.layout;
+    for (const key of ["x", "y", "w", "h"]) {
+      if (!Number.isFinite(layout[key])) throw new Error(`第 ${index + 1} 个模块的 layout.${key} 必须是数字。`);
+    }
+    if (layout.x < 0 || layout.y < 0 || layout.w <= 0 || layout.h <= 0 || layout.x + layout.w > 1 || layout.y + layout.h > 1) {
+      throw new Error(`第 ${index + 1} 个模块的 layout 必须完整位于 0–1 的内容区域内。`);
+    }
+    return { x: area.x + layout.x * area.w, y: area.y + layout.y * area.h, w: layout.w * area.w, h: layout.h * area.h };
+  });
+  for (let left = 0; left < boxes.length; left += 1) {
+    for (let right = left + 1; right < boxes.length; right += 1) {
+      const a = boxes[left];
+      const b = boxes[right];
+      const overlap = a.x < b.x + b.w - 0.01 && a.x + a.w > b.x + 0.01 && a.y < b.y + b.h - 0.01 && a.y + a.h > b.y + 0.01;
+      if (overlap) throw new Error(`第 ${left + 1} 与第 ${right + 1} 个模块的显式布局发生重叠。`);
+    }
+  }
+  return boxes;
+}
+
+function addContentSlide(slide, context, spec, pageNumber) {
+  addHeader(slide, context, spec.title || `第 ${pageNumber} 页`, pageNumber);
+  const hasSummary = Boolean(spec.summary);
+  if (hasSummary) {
+    slide.addShape(context.pptx.ShapeType.rect, {
+      x: 0.6, y: 1.12, w: 12.1, h: 0.68,
+      fill: { color: context.theme.colors.white },
+      line: { color: context.theme.colors.secondary, width: 0.8 },
+    });
+    assertTextFits(spec.summary, { w: 11.75, h: 0.4 }, "页面总述", 14, 0, context.allowOverflow);
+    slide.addText(spec.summary, {
+      x: 0.78, y: 1.25, w: 11.75, h: 0.4,
+      margin: 0, fontFace: context.theme.fontFace, fontSize: 14, bold: true,
+      color: context.theme.colors.text, valign: "middle",
+    });
+  }
+  const modules = spec.modules ?? [];
+  if (modules.length === 0) throw new Error(`内容页“${spec.title}”没有 modules。`);
+  if (modules.length > 8) throw new Error(`内容页“${spec.title}”最多支持 8 个模块。`);
+  const area = { x: 0.6, y: hasSummary ? 1.98 : 1.15, w: 12.1, h: hasSummary ? 4.85 : 5.68 };
+  const gap = Number.isFinite(spec.gap) ? spec.gap : 0.16;
+  const explicitBoxes = explicitModuleLayout(modules, area);
+  if (explicitBoxes) {
+    modules.forEach((module, index) => addModule(slide, context, module, explicitBoxes[index]));
+    return;
+  }
+  const columns = gridColumns(modules.length, spec.columns);
+  const rows = Math.ceil(modules.length / columns);
+  const weights = modules.map(moduleContentWeight);
+  const columnWeights = Array.isArray(spec.columnWeights)
+    ? spec.columnWeights.map(Number)
+    : Array.from({ length: columns }, (_, column) => Math.max(...weights.filter((_, index) => index % columns === column), 1));
+  const rowWeights = Array.isArray(spec.rowWeights)
+    ? spec.rowWeights.map(Number)
+    : Array.from({ length: rows }, (_, row) => Math.max(...weights.slice(row * columns, (row + 1) * columns), 1));
+  if (columnWeights.length !== columns) throw new Error(`columnWeights 必须包含 ${columns} 个值。`);
+  if (rowWeights.length !== rows) throw new Error(`rowWeights 必须包含 ${rows} 个值。`);
+  const columnSegments = normalizedSegments(columnWeights, area.x, area.w, gap);
+  const rowSegments = normalizedSegments(rowWeights, area.y, area.h, gap);
+  modules.forEach((module, index) => {
+    const row = Math.floor(index / columns);
+    const column = index % columns;
+    addModule(slide, context, module, {
+      x: columnSegments[column].start,
+      y: rowSegments[row].start,
+      w: columnSegments[column].size,
+      h: rowSegments[row].size,
+    });
+  });
+}
+
+function addTableSlide(slide, context, spec, pageNumber) {
+  addHeader(slide, context, spec.title || "表格", pageNumber);
+  if (spec.summary) {
+    assertTextFits(spec.summary, { w: 12.1, h: 0.48 }, "表格页总述", 14, 0, context.allowOverflow);
+    slide.addText(spec.summary, {
+      x: 0.6, y: 1.12, w: 12.1, h: 0.48,
+      margin: 0, fontFace: context.theme.fontFace, fontSize: 14, bold: true,
+      color: context.theme.colors.text,
+    });
+  }
+  addTableBlock(slide, context, spec.table ?? spec, {
+    x: 0.6, y: spec.summary ? 1.72 : 1.2, w: 12.1, h: spec.summary ? 5.15 : 5.67,
+  });
+}
+
+function paginateTableRows(block, box) {
+  const headerRows = tableHeaderRows(block);
+  const columnCount = tableColumns(block);
+  const widths = normalizeColumnWidths(block, columnCount, box.w);
+  const headerHeight = headerRows.reduce((sum, row) => sum + estimateTableRowHeight(row, widths, { header: true }), 0);
+  if (headerHeight >= box.h) throw new Error("表格表头超过独立表格页的可用高度。 ");
+  const chunks = [];
+  let current = [];
+  let used = headerHeight;
+  for (const row of block.rows ?? []) {
+    const rowHeight = estimateTableRowHeight(row, widths);
+    if (headerHeight + rowHeight > box.h) {
+      throw new Error("表格存在单行内容过长，无法在独立表格页以10号字完整显示；请加宽长文本列或把该记录改为独立内容页。 ");
+    }
+    if (current.length > 0 && used + rowHeight > box.h) {
+      chunks.push(current);
+      current = [];
+      used = headerHeight;
+    }
+    current.push(row);
+    used += rowHeight;
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks;
+}
+
+export function expandOversizedTableSlides(slides) {
+  const expanded = [];
+  for (const spec of slides) {
+    const type = String(spec.type ?? "content").toLowerCase();
+    if (type !== "table") {
+      expanded.push(spec);
+      continue;
+    }
+    if (spec.overflowPolicy === "warn-and-proceed") {
+      expanded.push(spec);
+      continue;
+    }
+    const block = spec.table ?? spec;
+    const box = { x: 0.6, y: spec.summary ? 1.72 : 1.2, w: 12.1, h: spec.summary ? 5.15 : 5.67 };
+    const headerRows = tableHeaderRows(block);
+    const columnCount = tableColumns(block);
+    const widths = normalizeColumnWidths(block, columnCount, box.w);
+    const totalHeight = [...headerRows.map((row) => estimateTableRowHeight(row, widths, { header: true })), ...(block.rows ?? []).map((row) => estimateTableRowHeight(row, widths))]
+      .reduce((sum, value) => sum + value, 0);
+    const splitMode = String(block.splitMode ?? "none").toLowerCase();
+    if (totalHeight <= box.h + 0.02 || splitMode !== "paginate") {
+      expanded.push(spec);
+      continue;
+    }
+    if (!String(block.splitReason ?? "").trim() || !String(block.approvalRef ?? "").trim()) {
+      throw new Error(`表格页“${spec.title || "表格"}”要求分页，但缺少 splitReason 或 approvalRef。`);
+    }
+
+    const chunks = paginateTableRows(block, box);
+    chunks.forEach((rows, index) => {
+      expanded.push({
+        ...spec,
+        title: index === 0 ? spec.title : `${spec.title || "表格"}（续${index}）`,
+        splitReason: block.splitReason,
+        approvalRef: block.approvalRef,
+        continuationIndex: index + 1,
+        table: { ...block, rows, splitMode: "none", splitReason: block.splitReason, approvalRef: block.approvalRef },
+      });
+    });
+  }
+  return expanded;
+}
+
+function addClosingSlide(slide, context, spec) {
+  slide.background = { color: context.theme.colors.white };
+  slide.addText(spec.title || "谢谢", {
+    x: 1.2, y: 2.45, w: 10.9, h: 1.3,
+    margin: 0, fontFace: context.theme.fontFace, fontSize: 34, bold: true,
+    color: context.theme.colors.primary, align: "center", valign: "middle", fit: "shrink",
+  });
+  if (spec.subtitle) {
+    slide.addText(spec.subtitle, {
+      x: 1.5, y: 4.0, w: 10.3, h: 0.65,
+      margin: 0, fontFace: context.theme.fontFace, fontSize: 14,
+      color: context.theme.colors.text, align: "center", valign: "middle", fit: "shrink",
+    });
+  }
+}
+
+function validateDeckSpec(deck) {
+  if (!deck || typeof deck !== "object" || Array.isArray(deck)) throw new Error("输入 JSON 必须是对象。 ");
+  if (!deck.title || typeof deck.title !== "string") throw new Error("输入 JSON 必须包含字符串 title。 ");
+  if (!Array.isArray(deck.slides) || deck.slides.length === 0) throw new Error("输入 JSON 必须包含非空 slides 数组。 ");
+  if (!deck.sourceManifest || typeof deck.sourceManifest !== "object" || Array.isArray(deck.sourceManifest)) {
+    throw new Error("输入 JSON 必须包含 sourceManifest，用于核对源文字、表格列和媒体素材。 ");
+  }
+}
+
+export async function buildPptx({ inputPath, outputPath, validate = true }) {
+  const absoluteInput = path.resolve(inputPath);
+  if (!fs.existsSync(absoluteInput)) throw new Error(`输入文件不存在：${absoluteInput}`);
+  const deck = JSON.parse(fs.readFileSync(absoluteInput, "utf8"));
+  validateDeckSpec(deck);
+  const inputDir = path.dirname(absoluteInput);
+  const slideSpecs = expandOversizedTableSlides(deck.slides);
+  const audit = auditDeckSpec({ ...deck, slides: slideSpecs }, { inputDir });
+  if (!audit.ok) {
+    throw new Error(`内容保真审计失败：${audit.errors.join("；")}`);
+  }
+  const runtime = loadPptxGenJS();
+  const pptx = new runtime.PptxGenJS();
+  pptx.author = deck.author || "ppt-maker";
+  pptx.company = deck.company || "";
+  pptx.subject = deck.subject || "";
+  pptx.title = deck.title;
+  pptx.lang = deck.lang || "zh-CN";
+  pptx.theme = {
+    headFontFace: deck.theme?.fontFace || DEFAULT_THEME.fontFace,
+    bodyFontFace: deck.theme?.fontFace || DEFAULT_THEME.fontFace,
+    lang: deck.lang || "zh-CN",
+  };
+  pptx.defineLayout({ name: "PPT_MAKER_WIDE", width: SLIDE_W, height: SLIDE_H });
+  pptx.layout = "PPT_MAKER_WIDE";
+
+  const logoValue = deck.logo === false ? null : (deck.logo || "assets/logo.png");
+  const context = {
+    pptx,
+    deck,
+    theme: makeTheme(deck.theme),
+    inputDir,
+    logo: logoValue ? resolveAsset(logoValue, inputDir) : null,
+  };
+  if (context.logo) requireLocalAsset(context.logo, "Logo");
+  defineLogoMasters(context);
+
+  const allowedOverflowSlides = [];
+  slideSpecs.forEach((spec, index) => {
+    const pageNumber = index + 1;
+    const allowOverflow = spec.overflowPolicy === "warn-and-proceed";
+    if (allowOverflow) allowedOverflowSlides.push(pageNumber);
+    const slideContext = { ...context, allowOverflow };
+    const type = String(spec.type ?? "content").toLowerCase();
+    const masterName = ["title", "closing"].includes(type) ? "PPT_MAKER_TITLE" : "PPT_MAKER_CONTENT";
+    const slide = pptx.addSlide(masterName);
+    slide.background = { color: context.theme.colors.white };
+    if (type === "title") addTitleSlide(slide, slideContext, spec);
+    else if (type === "agenda") addAgendaSlide(slide, slideContext, spec, pageNumber, false);
+    else if (type === "section") addAgendaSlide(slide, slideContext, spec, pageNumber, true);
+    else if (type === "content") addContentSlide(slide, slideContext, spec, pageNumber);
+    else if (type === "table") addTableSlide(slide, slideContext, spec, pageNumber);
+    else if (type === "closing") addClosingSlide(slide, slideContext, spec);
+    else throw new Error(`第 ${pageNumber} 页使用了不支持的页面类型：${type}`);
+  });
+
+  const absoluteOutput = path.resolve(
+    outputPath || path.join(inputDir, `${sanitizeFilename(deck.title)}.pptx`),
+  );
+  fs.mkdirSync(path.dirname(absoluteOutput), { recursive: true });
+  await pptx.writeFile({ fileName: absoluteOutput, compression: true });
+
+  const validation = validate ? validatePptx(absoluteOutput, { expectedSlides: slideSpecs.length, allowedOverflowSlides }) : null;
+  if (validation && !validation.ok) {
+    throw new Error(`PPTX 已生成但结构校验失败：${validation.errors.join("；")}`);
+  }
+  return {
+    ok: true,
+    input: absoluteInput,
+    output: absoluteOutput,
+    slides: slideSpecs.length,
+    pptxgenjs: runtime.version,
+    audit,
+    validation,
+    deliveryStatus: validation?.softBoundaryIssues?.length
+      ? "generated-with-boundary-decision-pending"
+      : allowedOverflowSlides.length > 0
+        ? "generated-with-boundary-review-required"
+        : "complete",
+  };
+}
+
+const isMain = process.argv[1]
+  && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+if (isMain) {
+  try {
+    const args = parseArgs(process.argv.slice(2));
+    const result = await buildPptx({
+      inputPath: args.input,
+      outputPath: args.output,
+      validate: args.validate,
+    });
+    if (args.json) console.log(JSON.stringify(result, null, 2));
+    else {
+      console.log(`PPTX 生成完成：${result.output}`);
+      console.log(`页面：${result.slides}；PptxGenJS：${result.pptxgenjs}`);
+      console.log(`内容保真审计：通过；必需条目 ${result.audit.stats.requiredItems} 项`);
+      if (result.validation) console.log("结构校验：通过");
+      if (result.deliveryStatus === "generated-with-boundary-decision-pending") {
+        console.log("交付状态：文件已生成，仅边界问题待用户决定；不得声明完整验收通过。");
+      } else if (result.deliveryStatus === "generated-with-boundary-review-required") {
+        console.log("交付状态：文件已生成，必须完成全页渲染后再判断是否存在边界问题。");
+      }
+    }
+  } catch (error) {
+    console.error(`生成失败：${error.message}`);
+    process.exitCode = 2;
+  }
+}
