@@ -1,4 +1,0 @@
-interface:
-  display_name: "成事应用开发"
-  short_description: "逐问梳理业务需求，确认页面原型后完成应用开发、测试、打包与部署"
-  default_prompt: "请使用 $chengshiai-app-building 逐问梳理我的应用需求，先确认页面效果图与产品需求说明书，再开发、测试并部署。"

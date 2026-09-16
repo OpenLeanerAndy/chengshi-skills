@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>产品需求说明书</title>
+<style>
+  :root{
+    --primary:#2563eb; --primary-light:#eff6ff;
+    --text:#1f2937; --muted:#6b7280; --line:#e5e7eb;
+    --ok:#059669; --warn:#d97706; --bg:#f9fafb;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:"Microsoft YaHei","PingFang SC",-apple-system,sans-serif;color:var(--text);background:var(--bg);line-height:1.7;padding:24px}
+  .doc{max-width:960px;margin:0 auto;background:#fff;border:1px solid var(--line);border-radius:8px;padding:48px 56px}
+  h1{font-size:26px;border-bottom:3px solid var(--primary);padding-bottom:12px;margin-bottom:8px}
+  .meta{color:var(--muted);font-size:14px;margin-bottom:32px}
+  h2{font-size:20px;color:var(--primary);margin:36px 0 12px;padding-left:10px;border-left:4px solid var(--primary)}
+  h3{font-size:16px;margin:24px 0 8px}
+  p{margin:6px 0}
+  ul,ol{margin:6px 0 6px 22px}
+  table{width:100%;border-collapse:collapse;margin:12px 0;font-size:14px}
+  th{background:var(--primary-light);text-align:left}
+  th,td{border:1px solid var(--line);padding:8px 10px;vertical-align:top}
+  .tag{display:inline-block;font-size:12px;padding:1px 8px;border-radius:10px;margin-right:6px}
+  .tag-user{background:#ecfdf5;color:var(--ok);border:1px solid #a7f3d0}
+  .tag-ai{background:#fff7ed;color:var(--warn);border:1px solid #fed7aa}
+  .tag-pending{background:#fef2f2;color:#dc2626;border:1px solid #fecaca}
+  .tag-suggest{background:var(--primary-light);color:var(--primary);border:1px solid #bfdbfe}
+  .func{border:1px solid var(--line);border-radius:8px;padding:16px 20px;margin:16px 0;background:#fcfcfd}
+  .func>h3{margin-top:0;color:var(--text)}
+  .toc{background:var(--primary-light);border-radius:8px;padding:16px 24px;font-size:14px}
+  .toc ol{margin-left:18px}
+  .note{background:#fffbeb;border:1px solid #fde68a;border-radius:6px;padding:10px 14px;font-size:13px;margin:12px 0}
+  .legend{font-size:13px;color:var(--muted);margin-bottom:24px}
+  @media print{body{padding:0;background:#fff}.doc{border:none;padding:16px}}
+</style>
+</head>
+<body>
+<div class="doc">
+
+<h1>产品需求说明书</h1>
+<p class="meta">项目名称：________　|　版本：v0.1　|　状态：草稿　|　日期：________</p>
+
+<p class="legend">信息来源标注：
+  <span class="tag tag-user">用户已明确</span>
+  <span class="tag tag-ai">AI推断</span>
+  <span class="tag tag-pending">待确认</span>
+  <span class="tag tag-suggest">AI建议</span>
+　业务内容为主，技术内容占比不超过 30%。</p>
+
+<div class="toc">
+<strong>目录</strong>
+<ol>
+  <li>背景与目标</li><li>用户与使用场景</li><li>当前工作方式 As-Is</li>
+  <li>当前问题与核心需求</li><li>产品目标</li><li>目标工作方式 To-Be</li>
+  <li>功能清单</li><li>功能详细设计</li><li>整体数据设计</li>
+  <li>与现有系统的关系</li><li>权限和安全</li><li>边界和异常</li>
+  <li>非功能要求</li><li>验收标准</li><li>本期不做的内容</li>
+</ol>
+</div>
+
+<h2>1. 背景与目标</h2>
+<ul>
+  <li>业务背景：</li>
+  <li>要解决的核心业务问题：</li>
+  <li>本期业务目标：</li>
+</ul>
+
+<h2>2. 用户与使用场景</h2>
+<ul>
+  <li>使用者（角色/岗位）：</li>
+  <li>个人工具还是多人协作：</li>
+  <li>典型使用场景：</li>
+</ul>
+
+<h2>3. 当前工作方式 As-Is</h2>
+<table>
+  <tr><th>当前目标</th><th>触发条件</th><th>步骤</th><th>结果</th></tr>
+  <tr><td></td><td></td><td></td><td></td></tr>
+</table>
+<ul>
+  <li>参与人 / 使用的系统 / 数据来源：</li>
+  <li>人工环节、易错点、耗时环节（含量化数据，作为价值验证基准）：</li>
+</ul>
+
+<h2>4. 当前问题与核心需求</h2>
+<table>
+  <tr><th>项目</th><th>内容</th></tr>
+  <tr><td>表面诉求</td><td></td></tr>
+  <tr><td>核心问题</td><td></td></tr>
+  <tr><td>真正业务目标（Root Need）</td><td></td></tr>
+  <tr><td>主要原因</td><td></td></tr>
+  <tr><td>重要约束</td><td></td></tr>
+</table>
+
+<h2>5. 产品目标</h2>
+
+<h2>6. 目标工作方式 To-Be</h2>
+<ul>
+  <li>目标流程（触发 → 自动获取 → 自动处理 → 人工环节 → 结果 → 保存追踪）：</li>
+  <li>自动化范围与理由：</li>
+  <li>保留给人工的环节与理由：</li>
+</ul>
+
+<h2>7. 功能清单</h2>
+<table>
+  <tr><th>编号</th><th>功能</th><th>解决流程中的哪个环节</th><th>优先级</th></tr>
+  <tr><td>F01</td><td></td><td></td><td>必须有</td></tr>
+</table>
+
+<h2>8. 功能详细设计</h2>
+
+<div class="func">
+<h3>F01　功能名称</h3>
+<table>
+  <tr><th style="width:90px">目标</th><td></td></tr>
+  <tr><th>使用场景</th><td></td></tr>
+  <tr><th>流程</th><td>谁触发 / 步骤 / 自动与人工 / 结束条件</td></tr>
+  <tr><th>数据</th><td>字段 / 来源 / 维护人 / 更新频率 / <strong>权威来源（Source of Truth）</strong> / 冲突处理</td></tr>
+  <tr><th>业务规则</th><td>执行条件 / 阈值 / 例外 / 部门差异 / 规则维护人</td></tr>
+  <tr><th>权限</th><td>查看 / 新增 / 修改 / 删除 / 审批 / 数据范围</td></tr>
+  <tr><th>异常</th><td>异常情况与处理方式</td></tr>
+  <tr><th>输出</th><td></td></tr>
+  <tr><th>界面</th><td>页面结构与操作方式摘要（此处嵌入页面示意图/原型）</td></tr>
+</table>
+</div>
+
+<div class="note">模拟或临时数据源必须明确标记"当前属于模拟或临时数据源"，不得伪装为已连接真实系统。</div>
+
+<h2>9. 整体数据设计</h2>
+<ul>
+  <li>核心数据对象与关系：</li>
+  <li>数据来源汇总与 Source of Truth 清单：</li>
+  <li>数据保存、更新与查询需求：</li>
+</ul>
+
+<h2>10. 与现有系统的关系</h2>
+<table>
+  <tr><th>系统</th><th>需要什么数据</th><th>获取方式</th><th>当前状态</th></tr>
+  <tr><td>CRM</td><td></td><td></td><td>真实连接 / 模拟 / 文件导入 / 后续接入</td></tr>
+</table>
+
+<h2>11. 权限和安全</h2>
+<table>
+  <tr><th>角色</th><th>可见范围</th><th>可操作</th><th>审批</th></tr>
+  <tr><td></td><td></td><td></td><td></td></tr>
+</table>
+<ul>
+  <li>敏感数据识别与处理（最小权限 / 数据隔离 / 审计 / 脱敏）：</li>
+  <li>密钥与凭证管理（环境变量 / .env / Secret，不进代码）：</li>
+</ul>
+
+<h2>12. 边界和异常</h2>
+<ul>
+  <li>系统边界：</li>
+  <li>整体异常场景与降级方式：</li>
+</ul>
+
+<h2>13. 非功能要求</h2>
+<ul>
+  <li>使用人数与性能预期：</li>
+  <li>运行环境（本机 / 内网 / 公网）：</li>
+  <li>可维护性要求：</li>
+</ul>
+
+<h2>14. 验收标准</h2>
+<h3>功能验收（对照第 8 章）</h3>
+<h3>价值验收（对照第 3 章 As-Is 量化基准）</h3>
+<table>
+  <tr><th>业务指标</th><th>改造前</th><th>目标</th></tr>
+  <tr><td>单次耗时</td><td></td><td></td></tr>
+  <tr><td>错误率</td><td></td><td></td></tr>
+</table>
+
+<h2>15. 本期不做的内容</h2>
+<ul><li>明确排除项与原因：</li></ul>
+
+<h2>附：需求确认记录</h2>
+<table>
+  <tr><th>日期</th><th>确认内容</th><th>确认人</th><th>结论</th></tr>
+  <tr><td></td><td></td><td></td><td></td></tr>
+</table>
+
+</div>
+</body>
+</html>

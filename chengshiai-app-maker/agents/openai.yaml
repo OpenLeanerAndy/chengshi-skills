@@ -1,0 +1,4 @@
+interface:
+  display_name: "成事应用制造"
+  short_description: "业务专家只需讲清业务，AI 完成需求发现、产品设计、开发、测试与部署"
+  default_prompt: "请使用 $chengshiai-app-maker，我想改善一件工作中的麻烦事 / 做一个应用 / 优化现有流程，请引导我完成从需求到上线的全过程。"
